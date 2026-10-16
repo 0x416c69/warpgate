@@ -12,9 +12,31 @@
 set -euo pipefail
 
 upstream="${WARPGATE_UPSTREAM:-https://github.com/warp-tech/warpgate.git}"
+# The fork deletes upstream's other workflows (publishing, release builds and
+# checks for parts it doesn't change).
+kept_workflows=(fork-image.yml test.yml clippy.yml)
 
 stable_tags() {
     git tag --list 'v*' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V
+}
+
+rebase_in_progress() {
+    [ -d "$(git rev-parse --git-path rebase-merge)" ] || [ -d "$(git rev-parse --git-path rebase-apply)" ]
+}
+
+# A release that edits a workflow the fork deleted stops the rebase with a
+# modify/delete conflict. Keep those deleted; fail on any other conflict.
+drop_deleted_workflows() {
+    local line paths=()
+    while IFS= read -r line; do
+        case "$line" in
+            "UD .github/workflows/"* | "DU .github/workflows/"*) paths+=("${line:3}") ;;
+            *) return 1 ;;
+        esac
+    done < <(git status --porcelain | grep -E '^(DD|AU|UD|UA|DU|AA|UU) ')
+    [ ${#paths[@]} -gt 0 ] || return 1
+    git rm --quiet -- "${paths[@]}"
+    echo "Kept deleted: ${paths[*]}"
 }
 
 git fetch --quiet --no-tags "$upstream" '+refs/tags/v*:refs/tags/v*'
@@ -50,5 +72,22 @@ if [ "$target" = "$base" ]; then
 fi
 
 echo "Replaying $(git rev-list --count "$base..HEAD") commit(s) from $base onto $target"
-git rebase --onto "$target" "$base"
+if ! git rebase --onto "$target" "$base"; then
+    while rebase_in_progress && drop_deleted_workflows; do
+        if GIT_EDITOR=true git rebase --continue; then
+            break
+        fi
+    done
+    if rebase_in_progress; then
+        echo "Resolve the conflicts above, then: git rebase --continue" >&2
+        exit 1
+    fi
+fi
+
+for workflow in .github/workflows/*; do
+    name=${workflow##*/}
+    if [[ " ${kept_workflows[*]} " != *" $name "* ]]; then
+        echo "Note: $target adds workflow $name; delete it if it doesn't apply to the fork"
+    fi
+done
 echo "Now based on $target. Build/test, then: git push --force-with-lease origin main"
