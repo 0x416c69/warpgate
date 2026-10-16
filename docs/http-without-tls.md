@@ -75,9 +75,28 @@ Keep `external_host` in Warpgate's config set to the public hostname. If idle
 web SSH/RDP sessions drop after a few minutes, look at OLS's connection
 timeout settings.
 
-## Building and running the Docker image
+## Docker
 
-From a checkout of this branch of the fork:
+Ready-made images are published to `ghcr.io/0x416c69/warpgate` (see the README
+for tags). Use one in Compose, keep the plaintext port on loopback, and add
+`tls: false` under `http:` in `<data dir>/warpgate.yaml`:
+
+```yaml
+services:
+  warpgate:
+    image: ghcr.io/0x416c69/warpgate:0.29.2
+    restart: unless-stopped
+    ports:
+      - 2222:2222
+      - 127.0.0.1:8888:8888
+      - 33306:33306
+    volumes:
+      - ./data:/data
+    stdin_open: true
+    tty: true
+```
+
+To build the image yourself instead, from a checkout of this fork:
 
 ```bash
 # optional: lets the embedded version read v0.29.2-<n>-g<hash> instead of a bare hash
@@ -85,13 +104,11 @@ git fetch --no-tags https://github.com/warp-tech/warpgate tag v0.29.2
 docker build -f docker/Dockerfile -t warpgate:0.29.2-plainhttp .
 ```
 
-Then point the Compose service at `image: warpgate:0.29.2-plainhttp` with
-`pull_policy: never`, and add `tls: false` under `http:` in
-`<data dir>/warpgate.yaml`.
-
 ## Rolling back
 
-The fork is based on v0.29.2 and adds no database migrations, so an upstream
-v0.29.2 image can run on the same data directory. Remove `tls: false` from
-`warpgate.yaml` (upstream ignores the key, with a warning, and serves HTTPS),
-switch the image back, and point the proxy at `https://` again.
+Each fork image is based on the upstream release of the same version and adds
+no database migrations, so the upstream image of that version
+(`ghcr.io/warp-tech/warpgate`) runs on the same data directory. Remove
+`tls: false` from `warpgate.yaml` (upstream ignores the key, with a warning,
+and serves HTTPS), switch the image back, and point the proxy at `https://`
+again.

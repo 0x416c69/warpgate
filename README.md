@@ -28,6 +28,63 @@
 
 ---
 
+## About this fork
+
+This is a fork of [warp-tech/warpgate](https://github.com/warp-tech/warpgate) that follows upstream's **stable releases** (currently v0.29.2) and adds one option, `http.tls`, so the web listener can serve plain HTTP/WS behind a reverse proxy that terminates TLS. Everything else is upstream Warpgate.
+
+Why: upstream's HTTP listener only speaks HTTPS, and some proxies can't talk TLS to a WebSocket backend (OpenLiteSpeed's WebSocket proxy is one). With this fork the chain becomes:
+
+```
+Browser --HTTPS/WSS--> reverse proxy --HTTP/WS--> Warpgate
+```
+
+```yaml
+http:
+  tls: false   # default: true
+```
+
+- Leaving the key out keeps the upstream behaviour: HTTPS only.
+- Only the HTTP/web listener is affected. SSH, MySQL, PostgreSQL, Kubernetes, RDP and VNC listeners, and connections to targets, keep their TLS settings.
+- With `tls: false`, `certificate`, `key` and `sni_certificates` are ignored, `warpgate check` skips the HTTPS certificate and the Docker healthcheck probes `http://`.
+- What browsers see doesn't change (`Secure` cookies, HSTS, `https://` URLs), so the UI must be reached through the HTTPS proxy, not on the plaintext port directly.
+
+**Security:** passwords, OTP codes and session cookies cross the proxy-to-Warpgate hop unencrypted. Keep that hop on loopback, a private network or a secured tunnel, and don't publish the plaintext port. Multi-node clusters need TLS on every node.
+
+### Docker image
+
+The [Fork image](.github/workflows/fork-image.yml) workflow publishes `ghcr.io/0x416c69/warpgate` for amd64 and arm64:
+
+| Tag | Contents |
+|---|---|
+| `0.29.2` | upstream v0.29.2 + this fork's changes |
+| `0.29.2-<commit>` | the same, pinned to one commit of this fork |
+| `latest` | the newest upstream stable release + this fork's changes |
+
+```yaml
+services:
+  warpgate:
+    image: ghcr.io/0x416c69/warpgate:0.29.2
+    restart: unless-stopped
+    ports:
+      - 2222:2222
+      - 127.0.0.1:8888:8888   # plain HTTP now: only the local reverse proxy should reach it
+      - 33306:33306
+    volumes:
+      - ./data:/data
+    stdin_open: true
+    tty: true
+```
+
+Then set `tls: false` under `http:` in `data/warpgate.yaml` and run `docker compose up -d`. Prefer a version tag over `latest`: new Warpgate releases can migrate the database, so upgrade on purpose (back up `data/`, change the tag, `docker compose pull && docker compose up -d`).
+
+OpenLiteSpeed setup, building the image yourself and rolling back are covered in [docs/http-without-tls.md](docs/http-without-tls.md).
+
+### Keeping up with upstream
+
+`main` is always an upstream stable release plus this fork's commits. A daily workflow publishes the image for each new upstream release the fork's changes still apply to. Notes for maintaining the fork are in [docs/fork-maintenance.md](docs/fork-maintenance.md).
+
+---
+
 Warpgate is a smart & fully transparent SSH, HTTPS, Kubernetes, MySQL, PostgreSQL, RDP and VNC bastion host that doesn't require a client app or an SSH wrapper.
 
 * Set it up in your DMZ, add user accounts and easily assign them to specific hosts and URLs within the network.
