@@ -1,0 +1,214 @@
+# Builds this fork's Docker image and publishes it to ghcr.io/<owner>/warpgate.
+#
+# - push to main: rebuild the upstream release main is currently based on
+# - daily: when upstream ships a new stable release, replay the fork's commits
+#   onto it (scripts/fork-sync.sh) and publish that; fails with a summary if the
+#   commits no longer apply
+# - manual: build any upstream release tag, the latest stable one by default
+name: Fork image
+
+on:
+  push:
+    branches: [main]
+    paths-ignore: ['**.md', 'docs/**']
+  schedule:
+    - cron: '23 4 * * *'
+  workflow_dispatch:
+    inputs:
+      upstream_tag:
+        description: Upstream release tag to build, e.g. v0.30.0 (empty = latest stable)
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fork-image
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+    outputs:
+      build: ${{ steps.plan.outputs.build }}
+      target: ${{ steps.plan.outputs.target }}
+      image: ${{ steps.plan.outputs.image }}
+      tags: ${{ steps.plan.outputs.tags }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Log into ghcr.io
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Decide what to build
+        id: plan
+        env:
+          EVENT: ${{ github.event_name }}
+          REQUESTED: ${{ inputs.upstream_tag }}
+        run: |
+          eval "$(scripts/fork-sync.sh --info)"
+          image="ghcr.io/${GITHUB_REPOSITORY,,}"
+          if [ "$EVENT" = push ]; then
+            target=$base
+          else
+            target=${REQUESTED:-$latest}
+          fi
+          if ! [[ "$target" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.]+)?$ ]]; then
+            echo "Not a release tag: $target" >&2
+            exit 1
+          fi
+          version=${target#v}
+
+          build=true
+          if [ "$EVENT" = schedule ] && docker buildx imagetools inspect "$image:$version" >/dev/null 2>&1; then
+            build=false
+          fi
+
+          tags="$image:$version,$image:$version-${GITHUB_SHA::7}"
+          if [ "$target" = "$latest" ]; then
+            tags="$tags,$image:latest"
+          fi
+
+          {
+            echo "build=$build"
+            echo "target=$target"
+            echo "image=$image"
+            echo "tags=$tags"
+          } >> "$GITHUB_OUTPUT"
+          echo "main is based on $base, the latest upstream release is $latest. Target: $target, build: $build." >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Check the fork applies to ${{ steps.plan.outputs.target }}
+        if: steps.plan.outputs.build == 'true'
+        env:
+          TARGET: ${{ steps.plan.outputs.target }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if ! scripts/fork-sync.sh "$TARGET"; then
+            {
+              echo "### The fork's commits don't apply cleanly to $TARGET"
+              echo
+              echo "Locally: \`scripts/fork-sync.sh $TARGET\`, resolve the conflicts,"
+              echo "\`git rebase --continue\`, test, then \`git push --force-with-lease origin main\`."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
+  build:
+    needs: plan
+    if: needs.plan.outputs.build == 'true'
+    strategy:
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            platform: linux/amd64
+            arch: amd64
+          - runner: ubuntu-24.04-arm
+            platform: linux/arm64
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Apply the fork onto ${{ needs.plan.outputs.target }}
+        env:
+          TARGET: ${{ needs.plan.outputs.target }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          scripts/fork-sync.sh "$TARGET"
+          # What `warpgate version` and the UI report
+          git tag -f "$TARGET-plainhttp"
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069
+
+      - name: Log into ghcr.io
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc
+        with:
+          context: .
+          file: docker/Dockerfile
+          platforms: ${{ matrix.platform }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.description=Warpgate ${{ needs.plan.outputs.target }} with optional TLS on the HTTP listener
+          cache-from: type=gha,scope=fork-${{ matrix.arch }}
+          cache-to: type=gha,scope=fork-${{ matrix.arch }}
+          outputs: type=image,"name=${{ needs.plan.outputs.image }}",push-by-digest=true,name-canonical=true,push=true
+          provenance: false
+
+      - name: Export digest
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/digests"
+          touch "$RUNNER_TEMP/digests/${DIGEST#sha256:}"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: digests-${{ matrix.arch }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    needs: [plan, build]
+    runs-on: ubuntu-latest
+    permissions:
+      packages: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          path: ${{ runner.temp }}/digests
+          pattern: digests-*
+          merge-multiple: true
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069
+
+      - name: Log into ghcr.io
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Tag the multi-arch image
+        working-directory: ${{ runner.temp }}/digests
+        env:
+          IMAGE: ${{ needs.plan.outputs.image }}
+          TAGS: ${{ needs.plan.outputs.tags }}
+        run: |
+          args=()
+          IFS=, read -ra tags <<< "$TAGS"
+          for tag in "${tags[@]}"; do
+            args+=(-t "$tag")
+          done
+          sources=()
+          for digest in *; do
+            sources+=("$IMAGE@sha256:$digest")
+          done
+          docker buildx imagetools create "${args[@]}" "${sources[@]}"
+          echo "Published ${TAGS//,/ }" >> "$GITHUB_STEP_SUMMARY"
