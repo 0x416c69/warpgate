@@ -35,7 +35,6 @@ use crate::listener_supervisor::{
 /// supervisor, which then owns rebinding for the process lifetime.
 async fn spawn_supervisor(
     name: &'static str,
-    requires_tls: bool,
     factory: ServerFactory,
     selector: ConfigSelector<WarpgateConfig>,
     config_rx: &watch::Receiver<WarpgateConfig>,
@@ -43,7 +42,7 @@ async fn spawn_supervisor(
 ) -> Result<JoinHandle<()>> {
     let params = selector(&config_rx.borrow());
     if params.enabled {
-        if requires_tls && params.tls.is_empty() {
+        if params.tls_enabled && params.tls.is_empty() {
             anyhow::bail!("{name} listener: no TLS certificate/key configured");
         }
         validate_tls(&params.tls)
@@ -134,10 +133,11 @@ pub async fn command(params: &GlobalParams, enable_admin_token: bool) -> Result<
     {
         let status_registry = services.listener_status.clone();
         let services = services.clone();
-        let factory: ServerFactory = Arc::new(move |address, proxy_protocol, tls| {
+        let factory: ServerFactory = Arc::new(move |address, proxy_protocol, tls_enabled, tls| {
             let services = services.clone();
             async move {
                 HTTPProtocolServer::new(&services)
+                    .with_tls(tls_enabled)
                     .bind(address, proxy_protocol, tls)
                     .await
             }
@@ -145,33 +145,37 @@ pub async fn command(params: &GlobalParams, enable_admin_token: bool) -> Result<
         });
         let base = base.clone();
         let selector: ConfigSelector<WarpgateConfig> = Arc::new(move |c: &WarpgateConfig| {
+            // With `http.tls: false` the certificate settings are ignored, so
+            // missing files don't matter and aren't watched.
             let mut tls = Vec::new();
-            if let Some(pair) =
-                TlsPathPair::new(&base, &c.store.http.certificate, &c.store.http.key)
-            {
-                tls.push(pair);
-            }
-            for sni in &c.store.http.sni_certificates {
-                if let Some(pair) = TlsPathPair::new(&base, &sni.certificate, &sni.key) {
+            if c.store.http.tls {
+                if let Some(pair) =
+                    TlsPathPair::new(&base, &c.store.http.certificate, &c.store.http.key)
+                {
                     tls.push(pair);
+                }
+                for sni in &c.store.http.sni_certificates {
+                    if let Some(pair) = TlsPathPair::new(&base, &sni.certificate, &sni.key) {
+                        tls.push(pair);
+                    }
                 }
             }
             ListenerParams {
                 enabled: true,
                 endpoint: c.store.http.listen.clone(),
                 proxy_protocol: c.store.http.proxy_protocol,
+                tls_enabled: c.store.http.tls,
                 tls,
             }
         });
-        supervisors.push(
-            spawn_supervisor("HTTP", true, factory, selector, &config_rx, status_registry).await?,
-        );
+        supervisors
+            .push(spawn_supervisor("HTTP", factory, selector, &config_rx, status_registry).await?);
     }
 
     {
         let status_registry = services.listener_status.clone();
         let services = services.clone();
-        let factory: ServerFactory = Arc::new(move |address, proxy_protocol, tls| {
+        let factory: ServerFactory = Arc::new(move |address, proxy_protocol, _tls_enabled, tls| {
             let services = services.clone();
             async move {
                 let server = SSHProtocolServer::new(&services).await?;
@@ -184,11 +188,11 @@ pub async fn command(params: &GlobalParams, enable_admin_token: bool) -> Result<
                 enabled: c.store.ssh.enable,
                 endpoint: c.store.ssh.listen.clone(),
                 proxy_protocol: c.store.ssh.proxy_protocol,
+                tls_enabled: false,
                 tls: Vec::new(),
             });
-        supervisors.push(
-            spawn_supervisor("SSH", false, factory, selector, &config_rx, status_registry).await?,
-        );
+        supervisors
+            .push(spawn_supervisor("SSH", factory, selector, &config_rx, status_registry).await?);
     }
 
     // These protocols are uniform: sync `new`, one enable flag, one cert/key pair.
@@ -198,25 +202,27 @@ pub async fn command(params: &GlobalParams, enable_admin_token: bool) -> Result<
             let status_registry = services.listener_status.clone();
             let services = services.clone();
             let base = base.clone();
-            let factory: ServerFactory = Arc::new(move |address, proxy_protocol, tls| {
-                let services = services.clone();
-                async move {
-                    $server::new(&services)
-                        .bind(address, proxy_protocol, tls)
-                        .await
-                }
-                .boxed()
-            });
+            let factory: ServerFactory =
+                Arc::new(move |address, proxy_protocol, _tls_enabled, tls| {
+                    let services = services.clone();
+                    async move {
+                        $server::new(&services)
+                            .bind(address, proxy_protocol, tls)
+                            .await
+                    }
+                    .boxed()
+                });
             let selector: ConfigSelector<WarpgateConfig> =
                 Arc::new(move |c: &WarpgateConfig| ListenerParams {
                     enabled: c.store.$cfg.enable,
                     endpoint: c.store.$cfg.listen.clone(),
                     proxy_protocol: c.store.$cfg.proxy_protocol,
+                    tls_enabled: true,
                     tls: TlsPathPair::new(&base, &c.store.$cfg.certificate, &c.store.$cfg.key)
                         .into_iter()
                         .collect(),
                 });
-            spawn_supervisor($name, true, factory, selector, &config_rx, status_registry).await?
+            spawn_supervisor($name, factory, selector, &config_rx, status_registry).await?
         }};
     }
 

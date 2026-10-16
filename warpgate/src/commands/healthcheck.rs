@@ -8,7 +8,12 @@ pub async fn command(params: &GlobalParams) -> Result<()> {
     let config = load_config(params, true)?;
 
     let url = format!(
-        "https://{}/@warpgate/api/info",
+        "{}://{}/@warpgate/api/info",
+        if config.store.http.tls {
+            "https"
+        } else {
+            "http"
+        },
         config.store.http.listen.address()
     );
 

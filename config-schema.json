@@ -26,6 +26,7 @@
         "proxy_protocol": false,
         "session_max_age": "30m",
         "sni_certificates": [],
+        "tls": true,
         "trust_x_forwarded_headers": false
       }
     },
@@ -184,6 +185,11 @@
           "items": {
             "$ref": "#/$defs/SniCertificateConfig"
           }
+        },
+        "tls": {
+          "description": "Serve this listener over TLS (HTTPS/WSS). Enabled by default.\n\nSet to `false` to serve plain HTTP/WS instead, for a TLS-terminating\nreverse proxy that cannot talk TLS to its backend. Credentials and session\ncookies then cross the proxy-to-Warpgate hop unencrypted, so only do this\nover a trusted private network or a secured tunnel. While `false`,\n`certificate`, `key` and `sni_certificates` are ignored, and other nodes of\na multi-node cluster cannot reach this one.",
+          "type": "boolean",
+          "default": true
         },
         "trust_x_forwarded_headers": {
           "type": "boolean",

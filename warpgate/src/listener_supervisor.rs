@@ -40,18 +40,22 @@ pub struct ListenerParams {
     pub enabled: bool,
     pub endpoint: ListenEndpoint,
     pub proxy_protocol: bool,
-    /// TLS pairs the listener serves (main + SNI). Empty for non-TLS protocols.
+    /// Whether the listener terminates TLS. Off for SSH, and for HTTP with
+    /// `http.tls: false`; a TLS listener without certificates won't start.
+    pub tls_enabled: bool,
+    /// TLS pairs the listener serves (main + SNI). Empty when `tls_enabled` is off.
     pub tls: Vec<TlsPathPair>,
 }
 
-/// Builds the protocol server on the given endpoint, handed the pre-loaded and
-/// validated TLS material (empty for non-TLS protocols). Called afresh on every
-/// (re)start. Two phases: the outer future *binds* the socket — an error here is
+/// Builds the protocol server on the given endpoint, handed whether TLS is
+/// enabled and the pre-loaded and validated TLS material (empty when it is
+/// not). Called afresh on every (re)start. Two phases: the outer future *binds* the socket — an error here is
 /// non-fatal (the supervisor pauses until the next config/cert change) — and the
 /// inner future *drives the accept loop* — an error there restarts the listener.
 pub type ServerFactory = Arc<
     dyn Fn(
             ListenEndpoint,
+            bool,
             bool,
             Vec<TlsCertificateAndPrivateKey>,
         ) -> BoxFuture<'static, Result<BoxFuture<'static, Result<()>>>>
@@ -214,9 +218,25 @@ impl<C: Send + 'static> ListenerSupervisor<C> {
         } else {
             match validate_tls(&desired.tls).await {
                 Ok(loaded) => loaded,
-                Err(error) => {
+                Err(error) if applied.as_ref().is_some_and(|p| p.tls_enabled) => {
                     error!(name = self.name, %error, "New TLS certificate/key is invalid; keeping the current listener");
                     // The current listener keeps serving its previously-reported status.
+                    return;
+                }
+                Err(error) => {
+                    // Don't keep a plaintext listener up once the config asks for TLS.
+                    if let Some(handle) = task.take() {
+                        abort_and_wait(handle).await;
+                    }
+                    *applied = Some(desired.clone());
+                    error!(name = self.name, %error, "TLS certificate/key is invalid; listener paused until the next config or certificate change");
+                    self.report_status(
+                        ListenerState::BindFailed,
+                        &desired.endpoint,
+                        Some(error.to_string()),
+                        Vec::new(),
+                    )
+                    .await;
                     return;
                 }
             }
@@ -238,7 +258,14 @@ impl<C: Send + 'static> ListenerSupervisor<C> {
         info!(name = self.name, endpoint = ?desired.endpoint, "Binding listener");
         // Phase 1: bind. A bind failure is non-fatal — leave the listener stopped
         // (`task` = None) so it retries on the next config or certificate change.
-        match (self.factory)(desired.endpoint.clone(), desired.proxy_protocol, tls).await {
+        match (self.factory)(
+            desired.endpoint.clone(),
+            desired.proxy_protocol,
+            desired.tls_enabled,
+            tls,
+        )
+        .await
+        {
             // Phase 2: drive the accept loop in its own task. If it ends, the task
             // branch of `run` restarts the listener.
             Ok(accept_loop) => {
@@ -398,6 +425,7 @@ mod tests {
             enabled,
             endpoint: endpoint(port),
             proxy_protocol: false,
+            tls_enabled: false,
             tls: vec![],
         }
     }
@@ -412,22 +440,24 @@ mod tests {
         starts: tokio::sync::mpsc::UnboundedSender<ListenEndpoint>,
         fail: Arc<AtomicBool>,
     ) -> ServerFactory {
-        Arc::new(move |endpoint: ListenEndpoint, _proxy_protocol, _tls| {
-            let _ = starts.send(endpoint);
-            let fail = fail.clone();
-            async move {
-                if fail.load(Ordering::SeqCst) {
-                    anyhow::bail!("simulated bind failure");
+        Arc::new(
+            move |endpoint: ListenEndpoint, _proxy_protocol, _tls_enabled, _tls| {
+                let _ = starts.send(endpoint);
+                let fail = fail.clone();
+                async move {
+                    if fail.load(Ordering::SeqCst) {
+                        anyhow::bail!("simulated bind failure");
+                    }
+                    // Bind ok; the accept loop pends forever (listener stays up).
+                    Ok(async move {
+                        std::future::pending::<()>().await;
+                        Ok(())
+                    }
+                    .boxed())
                 }
-                // Bind ok; the accept loop pends forever (listener stays up).
-                Ok(async move {
-                    std::future::pending::<()>().await;
-                    Ok(())
-                }
-                .boxed())
-            }
-            .boxed()
-        })
+                .boxed()
+            },
+        )
     }
 
     async fn next_start(
@@ -514,21 +544,23 @@ mod tests {
         let factory: ServerFactory = {
             let starts = starts_tx.clone();
             let accept_calls = accept_calls.clone();
-            Arc::new(move |endpoint: ListenEndpoint, _proxy_protocol, _tls| {
-                let _ = starts.send(endpoint);
-                let accept_calls = accept_calls.clone();
-                async move {
-                    Ok(async move {
-                        if accept_calls.fetch_add(1, Ordering::SeqCst) == 0 {
-                            anyhow::bail!("accept loop died");
+            Arc::new(
+                move |endpoint: ListenEndpoint, _proxy_protocol, _tls_enabled, _tls| {
+                    let _ = starts.send(endpoint);
+                    let accept_calls = accept_calls.clone();
+                    async move {
+                        Ok(async move {
+                            if accept_calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                                anyhow::bail!("accept loop died");
+                            }
+                            std::future::pending::<()>().await;
+                            Ok(())
                         }
-                        std::future::pending::<()>().await;
-                        Ok(())
+                        .boxed())
                     }
-                    .boxed())
-                }
-                .boxed()
-            })
+                    .boxed()
+                },
+            )
         };
         let selector: ConfigSelector<ListenerParams> = Arc::new(|p: &ListenerParams| p.clone());
 
@@ -589,6 +621,7 @@ mod tests {
             enabled: true,
             endpoint: endpoint(8443),
             proxy_protocol: false,
+            tls_enabled: true,
             tls: vec![TlsPathPair {
                 certificate: "/etc/warpgate/tls.crt".into(),
                 key: "/etc/warpgate/tls.key".into(),
@@ -608,5 +641,182 @@ mod tests {
             &Ok(miss),
             &desired
         ));
+    }
+
+    /// A started listener, as the factory saw it: (port, TLS enabled, TLS pairs).
+    type Start = (u16, bool, usize);
+
+    /// Factory recording each start's TLS mode; the accept loop pends until
+    /// aborted, which it reports on `stops`.
+    fn mode_factory(
+        starts: tokio::sync::mpsc::UnboundedSender<Start>,
+        stops: tokio::sync::mpsc::UnboundedSender<u16>,
+    ) -> ServerFactory {
+        struct ReportStop(u16, tokio::sync::mpsc::UnboundedSender<u16>);
+        impl Drop for ReportStop {
+            fn drop(&mut self) {
+                let _ = self.1.send(self.0);
+            }
+        }
+
+        Arc::new(
+            move |endpoint: ListenEndpoint, _proxy_protocol, tls_enabled, tls: Vec<_>| {
+                let _ = starts.send((endpoint.port(), tls_enabled, tls.len()));
+                let stop = ReportStop(endpoint.port(), stops.clone());
+                async move {
+                    Ok(async move {
+                        let _stop = stop;
+                        std::future::pending::<()>().await;
+                        Ok(())
+                    }
+                    .boxed())
+                }
+                .boxed()
+            },
+        )
+    }
+
+    fn write_cert_pair(dir: &Path) -> TlsPathPair {
+        let pair = TlsPathPair {
+            certificate: dir.join("tls.crt"),
+            key: dir.join("tls.key"),
+        };
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        std::fs::write(&pair.certificate, cert.cert.pem()).unwrap();
+        std::fs::write(&pair.key, cert.signing_key.serialize_pem()).unwrap();
+        pair
+    }
+
+    fn mode_params(port: u16, tls_enabled: bool, tls: Vec<TlsPathPair>) -> ListenerParams {
+        ListenerParams {
+            tls_enabled,
+            tls,
+            ..params(port, true)
+        }
+    }
+
+    async fn next_mode_start(starts: &mut tokio::sync::mpsc::UnboundedReceiver<Start>) -> Start {
+        timeout(Duration::from_secs(5), starts.recv())
+            .await
+            .expect("timed out waiting for a listener start")
+            .expect("start channel closed")
+    }
+
+    #[tokio::test]
+    async fn hands_tls_mode_to_the_factory_and_restarts_when_it_flips() {
+        let dir = tempdir().unwrap();
+        let pair = write_cert_pair(dir.path());
+        let (starts_tx, mut starts_rx) = unbounded_channel();
+        let (stops_tx, mut stops_rx) = unbounded_channel();
+        let selector: ConfigSelector<ListenerParams> = Arc::new(|p: &ListenerParams| p.clone());
+
+        // Plaintext: no TLS material, nothing to validate.
+        let (cfg_tx, cfg_rx) = watch::channel(mode_params(2501, false, vec![]));
+        let supervisor = ListenerSupervisor::new(
+            "test",
+            mode_factory(starts_tx, stops_tx),
+            selector,
+            registry(),
+        );
+        let handle = tokio::spawn(supervisor.run(WatchStream::new(cfg_rx)));
+        assert_eq!(next_mode_start(&mut starts_rx).await, (2501, false, 0));
+
+        // Turning TLS on swaps the plaintext listener for a TLS one.
+        cfg_tx
+            .send(mode_params(2501, true, vec![pair.clone()]))
+            .unwrap();
+        assert_eq!(next_mode_start(&mut starts_rx).await, (2501, true, 1));
+        let stopped = timeout(Duration::from_secs(5), stops_rx.recv()).await;
+        assert_eq!(
+            stopped.unwrap(),
+            Some(2501),
+            "plaintext listener kept running"
+        );
+
+        // And back off again.
+        cfg_tx.send(mode_params(2501, false, vec![])).unwrap();
+        assert_eq!(next_mode_start(&mut starts_rx).await, (2501, false, 0));
+
+        // The flag alone (no certificate paths either way) still restarts, so a
+        // listener can't stay plaintext once the config asks for TLS.
+        cfg_tx.send(mode_params(2501, true, vec![])).unwrap();
+        assert_eq!(next_mode_start(&mut starts_rx).await, (2501, true, 0));
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn stops_plaintext_listener_when_required_tls_material_is_invalid() {
+        let dir = tempdir().unwrap();
+        let missing = TlsPathPair {
+            certificate: dir.path().join("missing.crt"),
+            key: dir.path().join("missing.key"),
+        };
+        let (starts_tx, mut starts_rx) = unbounded_channel();
+        let (stops_tx, mut stops_rx) = unbounded_channel();
+        let status = registry();
+        let selector: ConfigSelector<ListenerParams> = Arc::new(|p: &ListenerParams| p.clone());
+
+        let (cfg_tx, cfg_rx) = watch::channel(mode_params(2601, false, vec![]));
+        let supervisor = ListenerSupervisor::new(
+            "test",
+            mode_factory(starts_tx, stops_tx),
+            selector,
+            status.clone(),
+        );
+        let handle = tokio::spawn(supervisor.run(WatchStream::new(cfg_rx)));
+        assert_eq!(next_mode_start(&mut starts_rx).await, (2601, false, 0));
+
+        cfg_tx.send(mode_params(2601, true, vec![missing])).unwrap();
+        let stopped = timeout(Duration::from_secs(5), stops_rx.recv()).await;
+        assert_eq!(
+            stopped.unwrap(),
+            Some(2601),
+            "plaintext listener kept running"
+        );
+        assert!(
+            timeout(Duration::from_millis(300), starts_rx.recv())
+                .await
+                .is_err(),
+            "listener must not start without valid TLS material"
+        );
+        let status = status.lock().await.get("test").cloned().unwrap();
+        assert_eq!(status.state, ListenerState::BindFailed);
+        assert!(status.error.is_some());
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn keeps_tls_listener_when_replacement_material_is_invalid() {
+        let dir = tempdir().unwrap();
+        let pair = write_cert_pair(dir.path());
+        let missing = TlsPathPair {
+            certificate: dir.path().join("missing.crt"),
+            key: dir.path().join("missing.key"),
+        };
+        let (starts_tx, mut starts_rx) = unbounded_channel();
+        let (stops_tx, mut stops_rx) = unbounded_channel();
+        let selector: ConfigSelector<ListenerParams> = Arc::new(|p: &ListenerParams| p.clone());
+
+        let (cfg_tx, cfg_rx) = watch::channel(mode_params(2701, true, vec![pair]));
+        let supervisor = ListenerSupervisor::new(
+            "test",
+            mode_factory(starts_tx, stops_tx),
+            selector,
+            registry(),
+        );
+        let handle = tokio::spawn(supervisor.run(WatchStream::new(cfg_rx)));
+        assert_eq!(next_mode_start(&mut starts_rx).await, (2701, true, 1));
+
+        cfg_tx.send(mode_params(2701, true, vec![missing])).unwrap();
+        assert!(
+            timeout(Duration::from_millis(500), stops_rx.recv())
+                .await
+                .is_err(),
+            "the working TLS listener should have been kept"
+        );
+
+        handle.abort();
     }
 }

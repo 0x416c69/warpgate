@@ -60,13 +60,23 @@ use crate::session_storage::SharedSessionStorage;
 
 pub struct HTTPProtocolServer {
     services: Services,
+    tls: bool,
 }
 
 impl HTTPProtocolServer {
     pub fn new(services: &Services) -> Self {
         Self {
             services: services.clone(),
+            tls: true,
         }
+    }
+
+    /// `false` serves plain HTTP/WS (`http.tls: false`), for use behind a
+    /// TLS-terminating reverse proxy. TLS is on unless turned off here.
+    #[must_use]
+    pub const fn with_tls(mut self, tls: bool) -> Self {
+        self.tls = tls;
+        self
     }
 }
 
@@ -110,7 +120,7 @@ impl ProtocolServer for HTTPProtocolServer {
         mut tls: Vec<TlsCertificateAndPrivateKey>,
     ) -> Result<BoxFuture<'static, Result<()>>> {
         // Present the cluster identity certificate along other SNI certs
-        if !tls.is_empty() {
+        if self.tls && !tls.is_empty() {
             // catch the weird case of no cert at all
             let identity = &self.services.cluster.tls_identity;
             tls.push(TlsCertificateAndPrivateKey {
@@ -359,19 +369,41 @@ impl ProtocolServer for HTTPProtocolServer {
             }
         });
 
-        let rustls_config = make_rustls_config(tls).context("rustls setup")?;
+        let rustls_config = if self.tls {
+            Some(make_rustls_config(tls).context("rustls setup")?)
+        } else {
+            None
+        };
 
         // Bind the socket now (errors here are non-fatal to the supervisor); the
         // returned future drives the accept loop (errors there restart the listener).
         let acceptor = address.poem_listener()?.into_acceptor().await?;
-        let acceptor = MaybeProxyProtocolAcceptor::new(acceptor, proxy_protocol)
-            .rustls(stream::once(future::ready(rustls_config)));
+        let acceptor = MaybeProxyProtocolAcceptor::new(acceptor, proxy_protocol);
 
-        Ok(async move {
-            Server::new_with_acceptor(acceptor).run(app).await?;
-            Ok(())
-        }
-        .boxed())
+        Ok(match rustls_config {
+            Some(rustls_config) => {
+                let acceptor = acceptor.rustls(stream::once(future::ready(rustls_config)));
+                async move {
+                    Server::new_with_acceptor(acceptor).run(app).await?;
+                    Ok(())
+                }
+                .boxed()
+            }
+            None => {
+                warn!(
+                    address = %address.address(),
+                    "TLS is disabled on the HTTP listener (`http.tls: false`): HTTP and WebSocket \
+                     traffic to it, including credentials and session cookies, is unencrypted. \
+                     Only expose it to a TLS-terminating reverse proxy over a trusted private \
+                     network or a secured tunnel."
+                );
+                async move {
+                    Server::new_with_acceptor(acceptor).run(app).await?;
+                    Ok(())
+                }
+                .boxed()
+            }
+        })
     }
 
     fn name(&self) -> &'static str {

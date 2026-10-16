@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use tracing::info;
+use tracing::{info, warn};
 use warpgate_common::GlobalParams;
 use warpgate_tls::{TlsCertificateBundle, TlsPrivateKey};
 
@@ -7,16 +7,22 @@ use crate::config::load_config;
 
 pub async fn command(params: &GlobalParams) -> Result<()> {
     let config = load_config(params, true)?;
-    TlsCertificateBundle::from_file(
-        params
-            .paths_relative_to()
-            .join(&config.store.http.certificate),
-    )
-    .await
-    .with_context(|| "Checking HTTPS certificate".to_string())?;
-    TlsPrivateKey::from_file(params.paths_relative_to().join(&config.store.http.key))
+    if config.store.http.tls {
+        TlsCertificateBundle::from_file(
+            params
+                .paths_relative_to()
+                .join(&config.store.http.certificate),
+        )
         .await
-        .with_context(|| "Checking HTTPS key".to_string())?;
+        .with_context(|| "Checking HTTPS certificate".to_string())?;
+        TlsPrivateKey::from_file(params.paths_relative_to().join(&config.store.http.key))
+            .await
+            .with_context(|| "Checking HTTPS key".to_string())?;
+    } else {
+        warn!(
+            "TLS is disabled on the HTTP listener (`http.tls: false`); skipping the HTTPS certificate check"
+        );
+    }
     if config.store.mysql.enable {
         TlsCertificateBundle::from_file(
             params

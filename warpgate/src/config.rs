@@ -238,6 +238,31 @@ mod tests {
     }
 
     #[test]
+    fn http_tls_is_a_known_key_defaulting_to_on() {
+        let (store, ignored) = parse("http:\n  listen: \"0.0.0.0:8888\"\n  tls: false\n");
+        assert!(ignored.is_empty(), "unexpected ignored keys: {ignored:?}");
+        assert!(!store.http.tls);
+
+        let (store, _) = parse("http:\n  listen: \"0.0.0.0:8888\"\n  tls: true\n");
+        assert!(store.http.tls);
+
+        let (store, _) =
+            parse("http:\n  listen: \"0.0.0.0:8888\"\n  certificate: c.pem\n  key: k.pem\n");
+        assert!(store.http.tls);
+    }
+
+    #[test]
+    fn http_tls_survives_legacy_web_admin_migration() {
+        let mut value: serde_yaml::Value =
+            serde_yaml::from_str("web_admin:\n  listen: \"0.0.0.0:8888\"\n  tls: false\n").unwrap();
+        check_and_migrate_config(&mut value);
+
+        let (store, ignored) = deserialize_store_collecting_ignored(value).unwrap();
+        assert!(ignored.is_empty(), "unexpected ignored keys: {ignored:?}");
+        assert!(!store.http.tls);
+    }
+
+    #[test]
     fn reports_unknown_top_level_key() {
         let (_store, ignored) = parse("external_host: x\nbogus_key: 1\n");
         assert_eq!(ignored, vec!["bogus_key".to_string()]);

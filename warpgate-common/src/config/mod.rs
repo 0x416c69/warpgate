@@ -12,7 +12,7 @@ use defaults::{
     _default_http_listen, _default_kubernetes_listen, _default_mysql_advertised_version,
     _default_mysql_listen, _default_postgres_listen, _default_rdp_listen, _default_recordings_path,
     _default_retention, _default_session_max_age, _default_ssh_inactivity_timeout,
-    _default_ssh_listen, _default_vnc_listen,
+    _default_ssh_listen, _default_true, _default_vnc_listen,
 };
 use poem::http::uri::Authority;
 use poem_openapi::{Object, Union};
@@ -512,6 +512,17 @@ pub struct HttpConfig {
     #[serde(default)]
     pub external_host: Option<String>,
 
+    /// Serve this listener over TLS (HTTPS/WSS). Enabled by default.
+    ///
+    /// Set to `false` to serve plain HTTP/WS instead, for a TLS-terminating
+    /// reverse proxy that cannot talk TLS to its backend. Credentials and session
+    /// cookies then cross the proxy-to-Warpgate hop unencrypted, so only do this
+    /// over a trusted private network or a secured tunnel. While `false`,
+    /// `certificate`, `key` and `sni_certificates` are ignored, and other nodes of
+    /// a multi-node cluster cannot reach this one.
+    #[serde(default = "_default_true")]
+    pub tls: bool,
+
     #[serde(default)]
     pub certificate: String,
 
@@ -540,6 +551,7 @@ impl Default for HttpConfig {
             proxy_protocol: false,
             external_port: None,
             external_host: None,
+            tls: true,
             certificate: "".into(),
             key: "".into(),
             trust_x_forwarded_headers: false,
@@ -980,7 +992,7 @@ impl WarpgateConfig {
 mod tests {
     use std::time::Duration;
 
-    use super::{SshConfig, WarpgateConfig, WarpgateConfigStore};
+    use super::{HttpConfig, SshConfig, WarpgateConfig, WarpgateConfigStore};
 
     #[test]
     fn keepalive_interval_is_a_humantime_string() {
@@ -1023,5 +1035,53 @@ mod tests {
         );
         assert_eq!(name("https://warp.example.com:8888"), None);
         assert_eq!(name("warp.example.com/gateway"), None);
+    }
+
+    #[test]
+    fn http_tls_defaults_to_enabled() {
+        assert!(HttpConfig::default().tls);
+        assert!(WarpgateConfigStore::default().http.tls);
+
+        // Existing configs don't carry the key at all
+        let config = serde_json::from_str::<WarpgateConfigStore>(
+            r#"{"http": {"listen": "0.0.0.0:8888", "certificate": "c.pem", "key": "k.pem"}}"#,
+        )
+        .unwrap();
+        assert!(config.http.tls);
+        let config = serde_json::from_str::<WarpgateConfigStore>("{}").unwrap();
+        assert!(config.http.tls);
+    }
+
+    #[test]
+    fn http_tls_explicit_values() {
+        let config = serde_json::from_str::<HttpConfig>(r#"{"tls": true}"#).unwrap();
+        assert!(config.tls);
+
+        // Disabling TLS leaves the certificate settings alone
+        let config = serde_json::from_str::<HttpConfig>(
+            r#"{"tls": false, "certificate": "c.pem", "key": "k.pem"}"#,
+        )
+        .unwrap();
+        assert!(!config.tls);
+        assert_eq!(config.certificate, "c.pem");
+        assert_eq!(config.key, "k.pem");
+
+        assert!(serde_json::from_str::<HttpConfig>(r#"{"tls": "no"}"#).is_err());
+    }
+
+    #[test]
+    fn http_tls_round_trips_and_is_in_schema() {
+        let value = serde_json::to_value(HttpConfig {
+            tls: false,
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(value.get("tls"), Some(&serde_json::Value::Bool(false)));
+        assert!(!serde_json::from_value::<HttpConfig>(value).unwrap().tls);
+
+        let schema = serde_json::to_value(schemars::schema_for!(WarpgateConfigStore)).unwrap();
+        let tls = schema.pointer("/$defs/HttpConfig/properties/tls").unwrap();
+        assert_eq!(tls.get("type"), Some(&"boolean".into()), "schema: {tls}");
+        assert_eq!(tls.get("default"), Some(&true.into()), "schema: {tls}");
     }
 }
